@@ -86,7 +86,7 @@ class MainWindow(QMainWindow):
         self.current_file = None
         self.tts_worker = None
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-        
+
         # 初始化 OCR (首次运行时会自动下载模型)
         # 指定使用中文识别模型，启用角度分类
         try:
@@ -275,8 +275,11 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("OCR引擎未成功加载，无法识别")
             return
         if self.tts_worker and self.tts_worker.isRunning():
-             self.statusBar.showMessage("正在朗读中，请先停止")
-             return # 或者先停止再开始？目前设计为不允许重叠
+             self.statusBar.showMessage("检测到正在朗读，先停止当前朗读...")
+             self.stop_reading()
+             # 短暂等待确保TTS真正停止
+             if self.tts_worker and self.tts_worker.isRunning():
+                 self.tts_worker.wait(1000)  # 最多等待1秒
 
         self.statusBar.showMessage("正在识别当前页面...")
         QApplication.processEvents() # 刷新UI显示状态
@@ -312,6 +315,7 @@ class MainWindow(QMainWindow):
     def _run_ocr(self, img_np):
         """在单独线程中执行 OCR """
         try:
+            self.ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False) 
             result = self.ocr.ocr(img_np, cls=True)
             if result and result[0]: # PaddleOCR 返回 [[lines...]] 格式
                 # 提取识别结果中的文本内容
