@@ -1,2 +1,6 @@
-PyQt6>=6.4.0
-PyMuPDF>=1.21.0
+PyQt6
+PyMuPDF
+paddlepaddle
+paddleocr
+pyttsx3
+opencv-python

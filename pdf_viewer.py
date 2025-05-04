@@ -1,9 +1,11 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                           QScrollArea, QSizePolicy)
-from PyQt6.QtGui import QPixmap, QImage
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QPixmap, QImage, QPainter
+from PyQt6.QtCore import Qt, pyqtSignal, QSize
 import fitz  # PyMuPDF
 import io
+import numpy as np
+import cv2
 
 class PDFViewer(QScrollArea):
     # 定义信号
@@ -16,6 +18,7 @@ class PDFViewer(QScrollArea):
         self.zoom_factor = 1.0
         self.pdf_document = None
         self.page_info = "请打开PDF文件"
+        self._page_count = 0
         
     def initUI(self):
         # 设置滚动区域属性
@@ -42,6 +45,7 @@ class PDFViewer(QScrollArea):
             self.pdf_document = fitz.open(file_path)
             self.current_page = 0
             self.zoom_factor = 1.0
+            self._page_count = len(self.pdf_document)
             self.update_page_view()
             self.page_changed.emit()
         except Exception as e:
@@ -99,3 +103,121 @@ class PDFViewer(QScrollArea):
         if self.pdf_document:
             self.zoom_factor *= 0.8
             self.update_page_view() 
+    
+    def get_current_page_image(self) -> QImage | None:
+        """获取当前页面的 QImage 对象"""
+        if not self.pdf_document or self.current_page < 0:
+            return None
+        
+        page = self.pdf_document.load_page(self.current_page)
+        # 使用更高的 DPI 来提高 OCR 准确率
+        zoom_matrix = fitz.Matrix(self.zoom_factor * 2, self.zoom_factor * 2) 
+        pix = page.get_pixmap(matrix=zoom_matrix, alpha=False)
+        
+        # 转换为 QImage
+        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+        return image.copy() # 返回副本以防原始数据被修改
+        
+    def get_current_page_image_bytes(self, dpi=200) -> bytes | None:
+        """获取当前页面的图像字节数据（PNG格式）
+        
+        Args:
+            dpi: 分辨率（每英寸点数），越高识别越精确但处理越慢
+            
+        Returns:
+            bytes: PNG格式的图像字节数据，如果无法获取则返回None
+        """
+        if not self.pdf_document or self.current_page < 0:
+            return None
+            
+        try:
+            # 使用PyMuPDF直接获取高分辨率图像
+            page = self.pdf_document.load_page(self.current_page)
+            
+            # 计算合适的缩放矩阵，基于请求的DPI
+            # 标准PDF分辨率是72 DPI，所以我们计算缩放系数
+            zoom = dpi / 72.0
+            zoom_matrix = fitz.Matrix(zoom, zoom)
+            
+            # 渲染页面到像素图
+            pix = page.get_pixmap(matrix=zoom_matrix, alpha=False)
+            
+            # 转换为PNG格式的字节数据
+            png_bytes = pix.tobytes("png")
+            
+            print(f"生成了 {len(png_bytes)/1024:.1f}KB 大小的页面图像，用于OCR处理")
+            return png_bytes
+            
+        except Exception as e:
+            print(f"获取页面图像字节数据时出错: {e}")
+            return None
+
+    def update_view(self):
+        """更新视图"""
+        if not self.pdf_document or self.current_page >= len(self.pdf_document):
+            return
+        
+        # 获取当前页面
+        page = self.pdf_document[self.current_page]
+        
+        # 应用缩放
+        zoom_matrix = fitz.Matrix(self.zoom_factor, self.zoom_factor)
+        pixmap = page.get_pixmap(matrix=zoom_matrix)
+        
+        # 转换为QImage
+        img_data = pixmap.samples
+        image = QImage(img_data, pixmap.width, pixmap.height, 
+                       pixmap.stride, QImage.Format.Format_RGB888)
+        
+        # 显示图像
+        pixmap = QPixmap.fromImage(image)
+        self.page_label.setPixmap(pixmap)
+        
+        # 更新页码信息
+        self.page_info = f"第 {self.current_page + 1} 页，共 {len(self.pdf_document)} 页"
+        
+        # 发送页面变更信号
+        self.page_changed.emit()
+
+    def wheelEvent(self, event):
+        """处理鼠标滚轮事件"""
+        modifiers = event.modifiers()
+        # 优先尝试 pixelDelta，如果为0再尝试 angleDelta
+        delta_y = event.pixelDelta().y()
+        if delta_y == 0:
+            delta_y = event.angleDelta().y()
+        
+        # 使用统一的 delta 变量名，简化后续逻辑
+        delta = delta_y 
+        
+        # 检查是否按下了Ctrl键
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            if delta > 0:
+                self.prev_page()
+            elif delta < 0:
+                self.next_page()
+            event.accept()
+        else:
+            # 如果没有按修饰键，则正常滚动
+            super().wheelEvent(event)
+
+    def go_to_page(self, page_num):
+        """跳转到指定页面"""
+        if not self.pdf_document:
+            return
+            
+        if 0 <= page_num < len(self.pdf_document):
+            self.current_page = page_num
+            self.update_page_view()
+            return True
+        return False
+        
+    @property
+    def current_page_num(self):
+        """获取当前页码"""
+        return self.current_page
+        
+    @property
+    def page_count(self):
+        """获取PDF总页数"""
+        return self._page_count if self.pdf_document else 0
