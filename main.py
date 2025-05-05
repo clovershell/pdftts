@@ -188,6 +188,13 @@ class MainWindow(QMainWindow):
         ocr_action.triggered.connect(self.start_ocr_and_read)
         self.addAction(ocr_action)
 
+        # 添加F9作为识别并朗读的额外快捷键
+        ocr_f9_shortcut = QKeySequence(Qt.Key.Key_F9)
+        ocr_f9_action = QAction("识别并朗读(F9)", self)
+        ocr_f9_action.setShortcut(ocr_f9_shortcut)
+        ocr_f9_action.triggered.connect(self.start_ocr_and_read)
+        self.addAction(ocr_f9_action)
+
         stop_tts_shortcut = QKeySequence("Ctrl+T")
         stop_tts_action = QAction("停止朗读", self)
         stop_tts_action.setShortcut(stop_tts_shortcut)
@@ -206,25 +213,25 @@ class MainWindow(QMainWindow):
         
         # 上一页
         prev_action = QAction("上一页", self)
-        prev_action.setStatusTip("查看上一页 (左箭头, PgUp 或 Ctrl+滚轮上)")
+        prev_action.setStatusTip("查看上一页 (左箭头, PgUp)")
         prev_action.triggered.connect(self.pdf_viewer.prev_page)
         toolbar.addAction(prev_action)
         
         # 下一页
         next_action = QAction("下一页", self)
-        next_action.setStatusTip("查看下一页 (右箭头, PgDown 或 Ctrl+滚轮下)")
+        next_action.setStatusTip("查看下一页 (右箭头, PgDown)")
         next_action.triggered.connect(self.pdf_viewer.next_page)
         toolbar.addAction(next_action)
         
         # 放大
         zoom_in_action = QAction("放大", self)
-        zoom_in_action.setStatusTip("放大视图 (Ctrl+=)")
+        zoom_in_action.setStatusTip("放大视图 (Ctrl+=, Ctrl+滚轮上)")
         zoom_in_action.triggered.connect(self.pdf_viewer.zoom_in)
         toolbar.addAction(zoom_in_action)
         
         # 缩小
         zoom_out_action = QAction("缩小", self)
-        zoom_out_action.setStatusTip("缩小视图 (Ctrl+-)")
+        zoom_out_action.setStatusTip("缩小视图 (Ctrl+- , Ctrl+滚轮下)")
         zoom_out_action.triggered.connect(self.pdf_viewer.zoom_out)
         toolbar.addAction(zoom_out_action)
         
@@ -232,7 +239,7 @@ class MainWindow(QMainWindow):
 
         # OCR & Read
         ocr_action = QAction("识别并朗读", self)
-        ocr_action.setStatusTip("识别当前页面文字并朗读")
+        ocr_action.setStatusTip("识别当前页面文字并朗读 (F9或Ctrl+R)")
         ocr_action.triggered.connect(self.start_ocr_and_read)
         toolbar.addAction(ocr_action)
 

@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                           QScrollArea, QSizePolicy)
-from PyQt6.QtGui import QPixmap, QImage, QPainter
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QCursor
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPoint
 import fitz  # PyMuPDF
 import io
 import numpy as np
@@ -19,6 +19,12 @@ class PDFViewer(QScrollArea):
         self.pdf_document = None
         self.page_info = "请打开PDF文件"
         self._page_count = 0
+        
+        # 添加鼠标拖动相关变量
+        self.drag_enabled = False
+        self.drag_start_pos = QPoint()
+        self.scroll_start_pos = QPoint()
+        self.setCursor(Qt.CursorShape.OpenHandCursor)  # 设置默认光标为手形
         
     def initUI(self):
         # 设置滚动区域属性
@@ -193,9 +199,9 @@ class PDFViewer(QScrollArea):
         # 检查是否按下了Ctrl键
         if modifiers & Qt.KeyboardModifier.ControlModifier:
             if delta > 0:
-                self.prev_page()
+                self.zoom_in()
             elif delta < 0:
-                self.next_page()
+                self.zoom_out()
             event.accept()
         else:
             # 如果没有按修饰键，则正常滚动
@@ -221,3 +227,51 @@ class PDFViewer(QScrollArea):
     def page_count(self):
         """获取PDF总页数"""
         return self._page_count if self.pdf_document else 0
+
+    def mousePressEvent(self, event):
+        """处理鼠标按下事件"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 记录拖动起始位置
+            self.drag_enabled = True
+            self.drag_start_pos = event.position().toPoint()
+            self.scroll_start_pos = QPoint(self.horizontalScrollBar().value(),
+                                         self.verticalScrollBar().value())
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)  # 改变光标为抓取状态
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """处理鼠标移动事件"""
+        if self.drag_enabled:
+            # 计算移动距离
+            current_pos = event.position().toPoint()
+            delta = current_pos - self.drag_start_pos
+            
+            # 更新滚动条位置 (注意方向是相反的，所以用减法)
+            new_pos_x = self.scroll_start_pos.x() - delta.x()
+            new_pos_y = self.scroll_start_pos.y() - delta.y()
+            
+            # 设置新的滚动位置
+            self.horizontalScrollBar().setValue(new_pos_x)
+            self.verticalScrollBar().setValue(new_pos_y)
+            
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """处理鼠标释放事件"""
+        if event.button() == Qt.MouseButton.LeftButton and self.drag_enabled:
+            self.drag_enabled = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)  # 恢复光标为手形
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+            
+    def leaveEvent(self, event):
+        """鼠标离开控件区域时的事件"""
+        # 确保鼠标离开区域时重置拖动状态
+        self.drag_enabled = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().leaveEvent(event)
