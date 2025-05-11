@@ -86,6 +86,8 @@ class MainWindow(QMainWindow):
         self.current_file = None
         self.tts_worker = None
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        self.session_history = {} # 用于存储 {file_path: page_num}
+        self.last_opened_file = None # 记录最后一个打开的文件路径
 
         # 初始化 OCR (首次运行时会自动下载模型)
         # 指定使用中文识别模型，启用角度分类
@@ -250,23 +252,63 @@ class MainWindow(QMainWindow):
         toolbar.addAction(stop_action)
         
     def open_file(self, file_path=None, page_num=0):
+        # 在打开新文件之前，如果当前有文件打开，保存其状态
+        if self.current_file and self.pdf_viewer.pdf_document:
+            current_page = self.pdf_viewer.current_page_num
+            self.session_history[self.current_file] = current_page
+            print(f"已保存文件 {os.path.basename(self.current_file)} 的状态到历史记录: 页码 {current_page}")
+            # 考虑在这里调用 self.save_session() 以便立即持久化，
+            # 但通常在关闭或明确保存操作时持久化更好，以避免频繁IO。
+            # 目前的逻辑是在 closeEvent 中保存，这意味着切换文件时的页码只在内存中，直到程序关闭。
+            # 如果希望切换文件时也立即保存到json，可以在这里取消注释下面这行：
+            # self.save_session() 
+
+        # 如果没有提供 file_path (例如通过工具栏按钮触发)，则弹出文件对话框
         if not file_path:
-            # 在PyQt6中，不再使用QFileDialog.Options()
-            file_path, _ = QFileDialog.getOpenFileName(
+            file_path_candidate, _ = QFileDialog.getOpenFileName(
                 self, "打开PDF文件", "", "PDF文件 (*.pdf)"
             )
+            if not file_path_candidate: # 用户取消了对话框
+                return
+            file_path = file_path_candidate
         
-        if file_path:
-            self.current_file = file_path
-            self.statusBar.showMessage(f"已打开: {file_path}")
-            self.pdf_viewer.load_pdf(file_path)
-            if page_num > 0 and page_num < self.pdf_viewer.page_count:
-                self.pdf_viewer.go_to_page(page_num)
-            self.setWindowTitle(f"PDF阅读器 - {os.path.basename(file_path)}")
-            self.update_status_bar()
-            # 文件打开时，确保停止之前的朗读 (如果存在)
+        if file_path and os.path.exists(file_path):
+            # 停止之前的朗读 (如果存在)
             self.stop_reading()
+
+            self.current_file = file_path
+            self.last_opened_file = file_path # 更新最后一个打开的文件
+            self.statusBar.showMessage(f"正在打开: {file_path}")
+            self.pdf_viewer.load_pdf(file_path)
+            self.setWindowTitle(f"PDF阅读器 - {os.path.basename(file_path)}")
+
+            # 确定要跳转到的页码
+            # 如果 page_num > 0 (通常由 load_last_session 传入)，则优先使用它
+            page_to_open = page_num 
+            if page_to_open <= 0: # 如果 page_num 未指定或为0，尝试从历史记录加载
+                page_to_open = self.session_history.get(file_path, 0)
             
+            if page_to_open > 0 and page_to_open < self.pdf_viewer.page_count:
+                self.pdf_viewer.go_to_page(page_to_open)
+                print(f"已跳转到文件 {os.path.basename(file_path)} 的页码: {page_to_open}")
+            else:
+                self.pdf_viewer.go_to_page(0) # 默认打开第一页
+
+            self.update_status_bar()
+            
+            # 可以在此处也调用一次 save_session，以确保新打开的文件及其初始页码（或历史页码）被记录
+            # self.save_session() 
+        elif file_path: # file_path 提供了但文件不存在
+            self.statusBar.showMessage(f"错误: 文件 {file_path} 不存在。")
+            print(f"错误: 文件 {file_path} 不存在。")
+            # 如果尝试打开的文件不存在，从历史记录中移除（如果存在）
+            if file_path in self.session_history:
+                del self.session_history[file_path]
+                print(f"已从历史记录中移除无效文件: {file_path}")
+            if self.last_opened_file == file_path:
+                self.last_opened_file = None # 如果是最后一个打开的文件，也清除
+            # self.save_session() # 可以选择保存这个移除操作
+
     def update_status_bar(self):
         """更新状态栏信息"""
         if self.pdf_viewer.pdf_document:
@@ -424,17 +466,21 @@ class MainWindow(QMainWindow):
 
     def save_session(self):
         """保存当前会话信息到配置文件"""
-        if not self.current_file:
+        if not self.current_file and not self.session_history: # 如果没有任何东西可保存
             return
+
+        if self.current_file: # 如果当前有打开的文件，更新其页码
+            self.session_history[self.current_file] = self.pdf_viewer.current_page_num
+            self.last_opened_file = self.current_file
             
         session_data = {
-            "last_file": self.current_file,
-            "last_page": self.pdf_viewer.current_page_num
+            "session_history": self.session_history,
+            "last_opened_file": self.last_opened_file
         }
         
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(session_data, f)
+                json.dump(session_data, f, indent=4) # 使用 indent 使 JSON 更易读
             print(f"会话信息已保存: {session_data}")
         except Exception as e:
             print(f"保存会话信息时出错: {e}")
@@ -442,19 +488,38 @@ class MainWindow(QMainWindow):
     def load_last_session(self):
         """加载上次会话信息并打开文件"""
         if not os.path.exists(self.config_file):
+            self.statusBar.showMessage("未找到配置文件。")
             return
             
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 session_data = json.load(f)
                 
-            last_file = session_data.get("last_file")
-            last_page = session_data.get("last_page", 0)
+            self.session_history = session_data.get("session_history", {})
+            self.last_opened_file = session_data.get("last_opened_file")
             
-            if last_file and os.path.exists(last_file):
-                print(f"正在打开上次的文件: {last_file}, 页码: {last_page}")
-                self.open_file(last_file, last_page)
+            page_to_open = 0
+            if self.last_opened_file and os.path.exists(self.last_opened_file):
+                page_to_open = self.session_history.get(self.last_opened_file, 0)
+                print(f"正在打开上次的文件: {self.last_opened_file}, 页码: {page_to_open}")
+                self.open_file(self.last_opened_file, page_to_open)
+            elif self.session_history: # 如果没有last_opened_file，但历史记录不为空，尝试打开历史记录中的第一个
+                # 这是一个可选行为，也可以选择不打开任何文件
+                first_file_in_history = next(iter(self.session_history), None)
+                if first_file_in_history and os.path.exists(first_file_in_history):
+                    page_to_open = self.session_history.get(first_file_in_history, 0)
+                    print(f"打开历史记录中的文件: {first_file_in_history}, 页码: {page_to_open}")
+                    self.open_file(first_file_in_history, page_to_open)
+                else:
+                    self.statusBar.showMessage("上次打开的文件路径无效或历史记录为空。")
+            else:
+                self.statusBar.showMessage("没有上次会话信息或文件路径无效。")
+
+        except json.JSONDecodeError:
+            self.statusBar.showMessage("配置文件格式错误。")
+            print("加载会话信息失败：配置文件格式错误。")
         except Exception as e:
+            self.statusBar.showMessage(f"加载会话出错: {type(e).__name__}")
             print(f"加载上次会话信息时出错: {e}")
 
     def closeEvent(self, event):
