@@ -181,25 +181,34 @@ class PDFViewer(QScrollArea):
             return None
 
     def highlight_text_box(self, box_coords):
-        """高亮显示指定的文字框
+        """高亮显示指定的文字框 (使用 QPainter 机制)
         
         Args:
             box_coords: 文字框的四个角点坐标 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                        这些是原始OCR坐标，将在 _draw_highlights 中被缩放。
         """
-        # 清除之前的高亮
-        self.clear_highlights()
-        
-        # 添加新的高亮框
+        # 增加对 box_coords 的有效性检查
+        if not box_coords or \
+           not isinstance(box_coords, list) or \
+           not all(isinstance(coord, (list, tuple)) and len(coord) == 2 
+                   for coord in box_coords):
+            print(f"PDFViewer: Invalid or empty box_coords for highlight: {box_coords}")
+            self.highlight_boxes = [] # 清空以防无效数据残留
+            self.update_page_view() # 更新视图以移除可能存在的旧高亮
+            return
+
+        # main.py 中的 on_text_segment_started 会先调用 clear_highlights,
+        # 所以这里直接设置新的高亮框
         self.highlight_boxes = [box_coords]
-        
-        # 重新绘制页面
-        self.update_page_view()
-    
+        self.update_page_view() # 重新绘制页面以显示高亮
+
     def clear_highlights(self):
-        """清除所有高亮"""
+        """清除所有高亮 (使用 QPainter 机制)"""
+        if not self.highlight_boxes: # 如果已经为空，则无需更新
+            return
         self.highlight_boxes = []
-        self.update_page_view()
-    
+        self.update_page_view() # 重新绘制页面以移除高亮
+
     def next_page(self):
         """跳转到下一页"""
         if self.pdf_document and self.current_page < len(self.pdf_document) - 1:

@@ -16,6 +16,9 @@ from PIL import Image
 
 from pdf_viewer import PDFViewer
 
+global was_stopped
+was_stopped = False
+
 # ==================== TTS Worker ====================
 # 使用 QThread 处理耗时任务，避免 UI 冻结
 class TTSWorker(QThread):
@@ -37,52 +40,50 @@ class TTSWorker(QThread):
         try:
             print(f"TTSWorker开始：准备朗读 {len(self.text_segments)} 个文字段")
             
-            # 逐个朗读每个段落
             for i in range(len(self.text_segments)):
                 if self.stop_requested:
-                    print("收到停止请求，退出朗读循环")
+                    print(f"TTSWorker: 收到停止请求 (在循环顶部)，退出朗读循环. 段落索引: {i}")
                     break
-                    
                 self.current_segment_index = i
                 current_text = self.text_segments[i]
-                
-                print(f"开始朗读段落 {i + 1}/{len(self.text_segments)}: {current_text[:30]}...")
-                
-                # 发送开始朗读信号
-                self.text_segment_started.emit(i)
-                
-                # 请求主线程朗读
+                if was_stopped:
+                    self.text_segment_started.emit(i - 1 if i > 0 else 0)
+                else:   
+                    self.text_segment_started.emit(i)
                 self.segment_completed = False
                 self.request_speak.emit(current_text, i)
                 
-                # 等待朗读完成
-                timeout = 0
-                while not self.segment_completed and not self.stop_requested and timeout < 300:  # 最多等待30秒
+                timeout_counter = 0
+                max_timeout_counts = 300
+                while not self.segment_completed and not self.stop_requested and timeout_counter < max_timeout_counts:
                     QThread.msleep(100)
-                    timeout += 1
+                    timeout_counter += 1
+                    if timeout_counter % 50 == 0:
+                        print(f"TTSWorker: 段落 {i + 1} - 等待朗读响应... (已等待 {timeout_counter/10:.1f}秒), seg_ok={self.segment_completed}, stop_req={self.stop_requested}")
                 
                 if self.stop_requested:
+                    print(f"TTSWorker: 段落 {i + 1} 朗读被停止 (在等待后检测到).")
                     break
-                    
-                if timeout >= 300:
-                    print(f"朗读段落 {i + 1} 超时")
+                if timeout_counter >= max_timeout_counts and not self.segment_completed:
+                    print(f"TTSWorker: 朗读段落 {i + 1} 超时")
                     self.error.emit(f"朗读段落 {i + 1} 超时")
                     break
-                
-                print(f"完成朗读段落 {i + 1}")
-                # 发送完成朗读信号
+                if not self.segment_completed:
+                    print(f"TTSWorker: 警告 - 段落 {i + 1} 等待结束，但 segment_completed 仍然为 False 且未停止/超时。")
+
                 self.text_segment_finished.emit(i)
-                
-                # 在段落之间添加短暂停顿
-                if i < len(self.text_segments) - 1:
+                if i < len(self.text_segments) - 1 and not self.stop_requested:
                     QThread.msleep(100)
             
-            print("所有段落朗读完成")
-            
+            if self.stop_requested:
+                print("TTSWorker: 循环因 stop_requested 而终止.")
+            else:
+                print("TTSWorker: 所有段落处理完成 (循环正常结束).")
         except Exception as e:
+            print(f"TTSWorker: run 方法发生异常: {e}")
             self.error.emit(f"TTS 错误: {e}")
         finally:
-            print("TTSWorker: run 方法结束，发送 finished 信号。")
+            print(f"TTSWorker: run 方法结束 (finally块), stop_requested={self.stop_requested}. 发送 finished 信号。")
             self.finished.emit()
 
     def on_segment_complete(self):
@@ -92,6 +93,8 @@ class TTSWorker(QThread):
     def stop(self):
         print("TTSWorker: stop() 方法被调用。")
         self.stop_requested = True
+        global was_stopped
+        was_stopped = True
 
 
 class MainWindow(QMainWindow):
@@ -100,17 +103,13 @@ class MainWindow(QMainWindow):
         self.initUI()  # 首先初始化 UI，包括创建 statusBar
         self.current_file = None
         self.tts_worker = None
+        self.is_stopping = False  # 新增：停止标志，避免竞态条件
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
         self.session_history = {} # 用于存储 {file_path: page_num}
         self.last_opened_file = None # 记录最后一个打开的文件路径
 
         # 初始化 TTS 引擎（在主线程中）
-        try:
-            self.tts_engine = pyttsx3.init()
-            print("TTS引擎初始化成功")
-        except Exception as e:
-            self.tts_engine = None
-            print(f"TTS引擎初始化失败: {e}")
+        self._init_tts_engine()
 
         # 初始化 OCR (首次运行时会自动下载模型)
         # 指定使用中文识别模型，启用角度分类
@@ -346,6 +345,9 @@ class MainWindow(QMainWindow):
 
     def start_ocr_and_read(self):
         """启动 OCR 识别和 TTS 朗读 """
+        print(f"开始OCR识别和朗读，当前状态: is_stopping={self.is_stopping}, worker存在={self.tts_worker is not None}")
+        self.pdf_viewer.clear_highlights() # 在开始新的一轮OCR前也清除一次
+        
         if not self.current_file:
             self.statusBar.showMessage("请先打开一个PDF文件")
             return
@@ -429,31 +431,36 @@ class MainWindow(QMainWindow):
                 
                 text_data.sort(key=sort_key)
                 
-                # 分离排序后的数据
-                text_segments = []
-                ocr_boxes = []
+                # 过滤空或仅含空格的文本段
+                filtered_text_segments = []
+                filtered_ocr_boxes = []
                 for box_coords, text_content, confidence, _, _ in text_data:
-                    text_segments.append(text_content)
-                    ocr_boxes.append(box_coords)
+                    if text_content and text_content.strip(): # 确保文本非空且去除首尾空格后非空
+                        filtered_text_segments.append(text_content)
+                        filtered_ocr_boxes.append(box_coords)
+                    else:
+                        # 可选：打印被过滤掉的文本段信息，用于调试
+                        print(f"OCR: Filtered out empty/whitespace segment: '{text_content}'")
                 
-                # 保存OCR结果供后续高亮使用
-                self.current_ocr_boxes = ocr_boxes
-                self.current_text_segments = text_segments
+                # 更新MainWindow的当前文本和框数据为过滤后的结果
+                self.current_ocr_boxes = filtered_ocr_boxes
+                self.current_text_segments = filtered_text_segments
                 
                 # 打印部分识别结果以供调试
-                full_text = " ".join(text_segments)
-                print(f"识别到 {len(text_segments)} 个文字块")
-                print(f"所有文字段:")
-                for i, segment in enumerate(text_segments):
-                    print(f"  [{i+1}] {segment}")
-                print(f"合并文本 (前200字符):\n{full_text[:200]}...") 
+                if filtered_text_segments:
+                    print(f"识别到 {len(filtered_text_segments)} 个有效文字块 (已过滤空值)")
+                    # 以下是可选的更详细的打印，如果需要可以取消注释
+                    # print(f"所有有效文字段:")
+                    # for i, segment in enumerate(filtered_text_segments):
+                    #     print(f"  [{i+1}] {segment}")
+                    # full_text = " ".join(filtered_text_segments)
+                    # print(f"合并文本 (前200字符):\n{full_text[:200]}...") 
                 
-                if text_segments:
-                    # OCR 完成后，切换回主线程启动 TTS Worker
+                if filtered_text_segments: # 使用过滤后的数据启动TTS
                     self.statusBar.showMessage("识别完成，准备朗读...")
-                    self._start_tts_with_segments(text_segments, ocr_boxes)
+                    self._start_tts_with_segments(filtered_text_segments, filtered_ocr_boxes)
                 else:
-                    self.statusBar.showMessage("未识别到文字")
+                    self.statusBar.showMessage("未识别到有效文字 (所有识别结果均为空或空格)")
             else:
                 self.statusBar.showMessage("未识别到文字")
 
@@ -468,20 +475,57 @@ class MainWindow(QMainWindow):
 
     def _start_tts_with_segments(self, text_segments, ocr_boxes):
         """在主线程中创建并启动分段 TTS QThread Worker"""
-        # 检查TTS引擎是否可用
-        if not self.tts_engine:
-            self.statusBar.showMessage("TTS引擎未初始化，无法朗读")
+        print(f"MainWindow: _start_tts_with_segments - 准备朗读 {len(text_segments)} 个文字段...")
+        # 重置停止标志
+        self.is_stopping = False
+        
+        # 确保TTS引擎可用并处于正确状态
+        print("MainWindow: _start_tts_with_segments - 调用 _ensure_tts_engine_ready() 检查引擎...")
+        if not self._ensure_tts_engine_ready():
+            self.statusBar.showMessage("TTS引擎初始化失败，无法朗读")
+            print("MainWindow: _start_tts_with_segments - _ensure_tts_engine_ready() 返回 False. 无法朗读.")
             return
-            
+        print("MainWindow: _start_tts_with_segments - _ensure_tts_engine_ready() 返回 True. 引擎应可用.")
+                
         # 检查并停止之前的朗读任务
         if self.tts_worker and self.tts_worker.isRunning():
-            print("检测到正在运行的 TTS worker，先停止...")
-            self.tts_worker.stop() # 请求停止
-            self.tts_worker.wait(2000) # 等待最多2秒结束
-            if self.tts_worker.isRunning():
-                print("警告：旧的 TTS worker 未能在超时内停止。")
+            print("MainWindow: _start_tts_with_segments - 检测到正在运行的旧 TTS worker，先停止...")
+            self.stop_reading() # stop_reading 内部会处理旧 worker 和旧引擎
+            # stop_reading 后，tts_engine 应该被重新初始化了，再次确认
+            print("MainWindow: _start_tts_with_segments - 旧 worker 停止后，再次调用 _ensure_tts_engine_ready()...")
+            if not self._ensure_tts_engine_ready():
+                self.statusBar.showMessage("停止旧朗读后TTS引擎初始化失败")
+                print("MainWindow: _start_tts_with_segments - 停止旧worker后引擎检查失败. 无法朗读.")
+                return
+            print("MainWindow: _start_tts_with_segments - 停止旧worker后引擎检查成功.")
 
-        print(f"准备朗读 {len(text_segments)} 个文字段...")
+        # 在启动新的 TTSWorker 前，直接测试当前主线程的 self.tts_engine
+        try:
+            # print("MainWindow: _start_tts_with_segments - 【预朗读测试】准备朗读 '引擎测试...\'\")
+            self.tts_engine.say("") # 使用无声的空格作为预热
+            self.tts_engine.runAndWait()
+            print("MainWindow: _start_tts_with_segments - 【预朗读测试】'空格' runAndWait() 调用完成.")
+        except Exception as e_pre_speak:
+            print(f"MainWindow: _start_tts_with_segments - 【预朗读测试】失败: {e_pre_speak}")
+            self.statusBar.showMessage(f"TTS预朗读测试失败: {e_pre_speak}")
+            # 如果预朗读失败，可能需要再次尝试初始化或报错返回
+            print("MainWindow: _start_tts_with_segments - 预朗读失败，尝试最后一次重新初始化引擎...")
+            if self._init_tts_engine(): # _init_tts_engine 内部也使用空格ping
+                print("MainWindow: _start_tts_with_segments - 最后一次重新初始化成功，再次尝试预朗读...")
+                try:
+                    self.tts_engine.say("") # 再次使用空格
+                    self.tts_engine.runAndWait()
+                    print("MainWindow: _start_tts_with_segments - 【预朗读再次测试】成功.")
+                except Exception as e_pre_speak2:
+                    print(f"MainWindow: _start_tts_with_segments - 【预朗读再次测试】仍然失败: {e_pre_speak2}")
+                    self.statusBar.showMessage("TTS引擎彻底无法工作")
+                    return # 彻底放弃
+            else:
+                print("MainWindow: _start_tts_with_segments - 最后一次重新初始化失败. 放弃.")
+                self.statusBar.showMessage("TTS引擎初始化彻底失败")
+                return
+            
+        print(f"MainWindow: _start_tts_with_segments - 创建新的 TTSWorker 实例，准备朗读 {len(text_segments)} 个段落.")
         self.tts_worker = TTSWorker(text_segments, ocr_boxes)
         # 连接信号和槽
         self.tts_worker.finished.connect(self.on_tts_finished)
@@ -495,6 +539,14 @@ class MainWindow(QMainWindow):
 
     def on_text_segment_started(self, segment_index):
         """开始朗读某个文字段时的槽函数"""
+        sender_worker = self.sender()
+        if sender_worker != self.tts_worker or not self.tts_worker:
+            print(f"MainWindow: 忽略来自过时或无效 worker 的 text_segment_started 信号。 Sender: {sender_worker}, Current: {self.tts_worker}")
+            return
+
+        # 首先清除所有现有高亮
+        self.pdf_viewer.clear_highlights()
+
         if hasattr(self, 'current_ocr_boxes') and segment_index < len(self.current_ocr_boxes):
             box_coords = self.current_ocr_boxes[segment_index]
             # 在PDF查看器上高亮显示当前朗读的文字框
@@ -509,6 +561,11 @@ class MainWindow(QMainWindow):
     
     def on_text_segment_finished(self, segment_index):
         """完成朗读某个文字段时的槽函数"""
+        sender_worker = self.sender()
+        if sender_worker != self.tts_worker or not self.tts_worker:
+            print(f"MainWindow: 忽略来自过时或无效 worker 的 text_segment_finished 信号。 Sender: {sender_worker}, Current: {self.tts_worker}")
+            return
+
         if hasattr(self, 'current_text_segments') and segment_index < len(self.current_text_segments):
             total_segments = len(self.current_text_segments)
             print(f"完成朗读段落 {segment_index + 1}/{total_segments}")
@@ -526,21 +583,47 @@ class MainWindow(QMainWindow):
         if self.tts_worker and self.tts_worker.isRunning():
             self.statusBar.showMessage("正在停止朗读...")
             print("请求停止 TTS worker...")
-            self.tts_worker.stop()
-            # 停止主线程的TTS引擎
+            
+            # 设置停止标志
+            self.is_stopping = True
+            
+            # 先停止主线程的TTS引擎
             if self.tts_engine:
                 try:
                     self.tts_engine.stop()
                     print("主线程TTS引擎已停止")
                 except Exception as e:
                     print(f"停止主线程TTS引擎时出错: {e}")
+            
+            # 然后请求停止worker
+            self.tts_worker.stop()
+            
+            # 等待worker停止
+            if not self.tts_worker.wait(3000):  # 增加等待时间到3秒
+                print("警告: TTS worker 未能在超时内停止")
+            
+            print("TTS worker 已停止或超时。准备重新初始化TTS引擎。")
+            QApplication.processEvents() # 处理任何挂起的Qt事件
+            QThread.msleep(100) # 增加一个短暂的延迟，给TTS驱动一些时间
+
+            # 彻底重新初始化TTS引擎以确保下次使用时状态正常
+            print("停止后重新初始化TTS引擎...")
+            if not self._init_tts_engine():
+                print("警告: TTS引擎重新初始化失败")
+            
+            # 最后清理worker引用
+            self.tts_worker = None
+            
             # 清除高亮
             self.pdf_viewer.clear_highlights()
-            # 让 on_tts_finished 信号处理状态消息更新
+            
+            # 清除停止标志
+            self.is_stopping = False
+            
+            self.statusBar.showMessage("朗读已停止")
         else:
-            # 如果没有活动的 worker，也清空状态栏消息或设为默认
-            # self.statusBar.showMessage("当前没有在朗读") 
-            pass # 或者保持当前状态栏消息
+            # 确保停止标志被清除
+            self.is_stopping = False
 
     def on_tts_finished(self):
         """TTS Worker 完成时的槽函数"""
@@ -656,21 +739,153 @@ class MainWindow(QMainWindow):
 
     def on_request_speak(self, text, segment_index):
         """处理朗读请求（在主线程中执行）"""
+        requesting_worker = self.sender()
+        if not isinstance(requesting_worker, TTSWorker):
+            print(f"MainWindow: on_request_speak - sender 不是 TTSWorker 实例: {requesting_worker}")
+            return
+
         try:
-            print(f"主线程开始朗读段落 {segment_index + 1}: {text[:30]}...")
-            # 在主线程中朗读
-            self.tts_engine.say(text)
-            self.tts_engine.runAndWait()
-            print(f"主线程完成朗读段落 {segment_index + 1}")
+            # 1. 如果请求的 worker 自身已被明确要求停止，则不应朗读，并通知其完成以便退出。
+            if requesting_worker.stop_requested:
+                print(f"MainWindow: on_request_speak - 请求的 worker {requesting_worker} 已标记为停止，跳过朗读。段落: {segment_index + 1}")
+                requesting_worker.on_segment_complete()
+                return
+
+            # 2. 如果 MainWindow 正在执行全局停止操作 (self.is_stopping is True)
+            #    并且这个停止操作是针对当前发出请求的 worker (requesting_worker == self.tts_worker),
+            #    那么也应该跳过朗读。
+            #    如果 self.is_stopping is True 但 requesting_worker != self.tts_worker，
+            #    这意味着 MainWindow 正在停止另一个 worker，此时这个旧 worker 的请求也应被忽略。
+            if self.is_stopping:
+                if requesting_worker == self.tts_worker:
+                    print(f"MainWindow: on_request_speak - MainWindow正在停止当前worker {requesting_worker}，跳过朗读。段落: {segment_index + 1}")
+                else:
+                    # 这种情况理论上不常发生，因为旧 worker 应在被替换前停止。但作为防御。
+                    print(f"MainWindow: on_request_speak - MainWindow全局停止中，但请求来自过时/非当前worker {requesting_worker} (当前应为 {self.tts_worker})，跳过。段落: {segment_index + 1}")
+                requesting_worker.on_segment_complete() # 让它结束等待
+                return
             
-            # 通知worker段落朗读完成
-            if self.tts_worker:
-                self.tts_worker.on_segment_complete()
-                
+            # 3. 如果当前 MainWindow 有一个活动的 tts_worker，但这个请求不是来自它，
+            #    那么这个请求来自一个过时的 worker，应该忽略。
+            if self.tts_worker and self.tts_worker != requesting_worker:
+                print(f"MainWindow: on_request_speak - 请求来自过时worker {requesting_worker}，但当前活动worker是 {self.tts_worker}。跳过朗读。段落: {segment_index + 1}")
+                requesting_worker.on_segment_complete()
+                return
+
+            # 4. 确保TTS引擎可用
+            if not self._ensure_tts_engine_ready():
+                print(f"MainWindow: on_request_speak - 错误: 无法确保TTS引擎可用. 段落: {segment_index + 1}")
+                # 仅在 worker 未被要求停止时才发送错误信号
+                if not requesting_worker.stop_requested:
+                    requesting_worker.error.emit("TTS引擎状态异常，无法朗读")
+                else: # 否则，让它完成以退出
+                    requesting_worker.on_segment_complete()
+                return
+            
+            # 5. 执行朗读
+            speech_successful = False
+            try:
+                # 在实际朗读前再次检查 worker 是否已被要求停止 (因为 runAndWait 是阻塞的)
+                if requesting_worker.stop_requested:
+                    print(f"MainWindow: on_request_speak - 朗读前检测到 worker {requesting_worker} 已停止。段落: {segment_index + 1}")
+                    requesting_worker.on_segment_complete()
+                    return
+
+                self.tts_engine.say(text)
+                self.tts_engine.runAndWait()
+                speech_successful = True
+            except RuntimeError as tts_runtime_error:
+                print(f"MainWindow: on_request_speak - TTS引擎朗读时出错 (RuntimeError): {tts_runtime_error}. 段落: {segment_index + 1}")
+                # 可以在这里尝试重新初始化引擎并重试一次，如果适用
+                # if self._ensure_tts_engine_ready(): ...
+            except Exception as general_tts_error:
+                print(f"MainWindow: on_request_speak - TTS引擎朗读时发生未知错误: {general_tts_error}. 段落: {segment_index + 1}")
+
+            # 6. 回调请求的 worker
+            # 检查朗读后 worker 是否被要求停止
+            if requesting_worker.stop_requested:
+                print(f"MainWindow: on_request_speak - 朗读后检测到 worker {requesting_worker} 已停止。段落: {segment_index + 1}")
+                requesting_worker.on_segment_complete()
+            elif speech_successful:
+                requesting_worker.on_segment_complete()
+            else:
+                # 确保 worker 仍然存在且未被要求停止才发送错误
+                if not requesting_worker.stop_requested: # 避免在已停止的worker上触发error
+                    requesting_worker.error.emit(f"朗读段落 {segment_index + 1} 失败")
+                else: # 如果在朗读失败的同时也被要求停止了，也标记为完成
+                    requesting_worker.on_segment_complete()
+                    
         except Exception as e:
-            print(f"主线程朗读时出错: {e}")
-            if self.tts_worker:
-                self.tts_worker.error.emit(f"朗读错误: {e}")
+            print(f"MainWindow: on_request_speak - 发生外部错误: {e}. 段落: {segment_index if 'segment_index' in locals() else '未知'}")
+            # 确保回调给正确的 worker，并检查其状态
+            if requesting_worker:
+                if not requesting_worker.stop_requested:
+                    requesting_worker.error.emit(f"朗读时发生严重错误: {e}")
+                else: # 如果 worker 已被要求停止，则通知完成以允许干净退出
+                    requesting_worker.on_segment_complete()
+
+    def _init_tts_engine(self):
+        """初始化或重新初始化TTS引擎"""
+        try:
+            # 如果已有引擎，先清理
+            # if hasattr(self, 'tts_engine') and self.tts_engine:
+            #     try:
+            #         # self.tts_engine.stop() # stop() 只是停止当前话语
+            #         del self.tts_engine
+            #         self.tts_engine = None
+            #         print("旧 TTS 引擎已del并置空")
+            #     except Exception as e:
+            #         print(f"清理旧TTS引擎时出错: {e}")
+            
+            # 创建新的TTS引擎
+            self.tts_engine = pyttsx3.init()
+            
+            # 设置TTS引擎属性（确保引擎处于正确状态）
+            voices = self.tts_engine.getProperty('voices')
+            if voices:
+                # 尝试设置中文语音（如果可用）
+                for voice in voices:
+                    if 'chinese' in voice.name.lower() or 'zh' in voice.id.lower():
+                        self.tts_engine.setProperty('voice', voice.id)
+                        break
+            
+            # 设置语速（可选）
+            self.tts_engine.setProperty('rate', 200)  # 每分钟200词
+
+            # 尝试一个快速的 "ping" 来确保引擎工作
+            try:
+                # self.tts_engine.say("你好") # 使用一个简短的实际词语
+                self.tts_engine.say("") # 改回使用空格进行 ping
+                self.tts_engine.runAndWait() # 确保它能完成一个循环
+            except Exception as ping_error:
+                # print(f"TTS引擎初始化后ping测试失败 (使用 '你好'): {ping_error}")
+                print(f"TTS引擎初始化后ping测试失败 (使用空格): {ping_error}")
+                # 将特定错误封装，以便上层可以判断
+                # raise RuntimeError("TTS engine ping test failed after init with '你好'") from ping_error
+                raise RuntimeError("TTS engine ping test failed after init with space") from ping_error
+            
+            # print("TTS引擎初始化并ping测试成功 (使用 '你好')")
+            print("TTS引擎初始化并ping测试成功 (使用空格)")
+            return True
+        except Exception as e:
+            self.tts_engine = None
+            print(f"TTS引擎初始化失败: {e}")
+            return False
+
+    def _ensure_tts_engine_ready(self):
+        """确保TTS引擎处于可用状态"""
+        if not self.tts_engine:
+            print("TTS引擎为空，尝试重新初始化...")
+            return self._init_tts_engine()
+        
+        try:
+            # 测试引擎是否正常工作
+            # 获取一个简单的属性来检查引擎状态
+            _ = self.tts_engine.getProperty('rate')
+            return True
+        except Exception as e:
+            print(f"TTS引擎状态异常: {e}，重新初始化...")
+            return self._init_tts_engine()
 
 def main():
     app = QApplication(sys.argv)
