@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                           QScrollArea, QSizePolicy)
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QCursor
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPoint
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QCursor, QPen, QColor, QBrush
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPoint, QRectF
 import fitz  # PyMuPDF
 import io
 import numpy as np
@@ -25,6 +25,10 @@ class PDFViewer(QScrollArea):
         self.drag_start_pos = QPoint()
         self.scroll_start_pos = QPoint()
         self.setCursor(Qt.CursorShape.OpenHandCursor)  # 设置默认光标为手形
+        
+        # 高亮相关变量
+        self.highlight_boxes = []  # 存储当前高亮的文字框坐标
+        self.ocr_dpi_scale = 200 / 72.0  # OCR使用的DPI与显示DPI的缩放比例
         
     def initUI(self):
         # 设置滚动区域属性
@@ -76,15 +80,125 @@ class PDFViewer(QScrollArea):
         image = QImage(img_data, pixmap.width, pixmap.height, 
                        pixmap.stride, QImage.Format.Format_RGB888)
         
+        # 在图像上绘制高亮框
+        if self.highlight_boxes:
+            image = self._draw_highlights(image)
+        
         # 显示图像
-        pixmap = QPixmap.fromImage(image)
-        self.page_label.setPixmap(pixmap)
+        qpixmap = QPixmap.fromImage(image)
+        self.page_label.setPixmap(qpixmap)
         
         # 更新页码信息
         self.page_info = f"第 {self.current_page + 1} 页，共 {len(self.pdf_document)} 页"
         
         # 发送页面变更信号
         self.page_changed.emit()
+
+    def _draw_highlights(self, image):
+        """在图像上绘制高亮框"""
+        # 创建QPainter在图像上绘制
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)  # 启用反锯齿
+        
+        # 设置高亮颜色（黄色半透明，增加透明度）
+        highlight_color = QColor(255, 255, 0, 100)  # RGBA: 黄色，40%透明度
+        border_color = QColor(255, 200, 0, 180)     # 边框颜色：深黄色，70%透明度
+        
+        painter.setBrush(QBrush(highlight_color))
+        painter.setPen(QPen(border_color, 3))  # 增加边框宽度到3像素
+        
+        for box_coords in self.highlight_boxes:
+            # 将OCR坐标转换为当前显示图像的坐标
+            scaled_coords = self._scale_coords_to_display(box_coords)
+            if scaled_coords:
+                # 创建多边形并填充
+                points = [QPoint(int(x), int(y)) for x, y in scaled_coords]
+                painter.drawPolygon(points)
+                
+                # 添加一个稍微内缩的高亮边框，增强视觉效果
+                inner_highlight = QColor(255, 255, 100, 50)  # 更浅的黄色
+                painter.setBrush(QBrush(inner_highlight))
+                painter.setPen(QPen(QColor(255, 255, 0, 120), 1))
+                
+                # 计算内缩的坐标点（向内缩小2像素）
+                if len(points) >= 4:
+                    # 简单的内缩处理
+                    center_x = sum(p.x() for p in points) / len(points)
+                    center_y = sum(p.y() for p in points) / len(points)
+                    
+                    inner_points = []
+                    for p in points:
+                        # 向中心方向内缩2像素
+                        dx = p.x() - center_x
+                        dy = p.y() - center_y
+                        if dx != 0 or dy != 0:
+                            factor = max(0.1, 1 - 2 / max(abs(dx), abs(dy)))
+                            new_x = center_x + dx * factor
+                            new_y = center_y + dy * factor
+                            inner_points.append(QPoint(int(new_x), int(new_y)))
+                        else:
+                            inner_points.append(p)
+                    
+                    if len(inner_points) >= 3:
+                        painter.drawPolygon(inner_points)
+        
+        painter.end()
+        return image
+
+    def _scale_coords_to_display(self, ocr_coords):
+        """将OCR坐标转换为当前显示图像的坐标
+        
+        Args:
+            ocr_coords: OCR返回的四个角点坐标 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        
+        Returns:
+            缩放后的坐标列表
+        """
+        try:
+            # OCR使用200 DPI，PDF显示使用当前zoom_factor
+            # 由于OCR图像和显示图像都是基于同一个PDF页面，我们需要考虑两者的分辨率差异
+            
+            # OCR图像的DPI缩放系数
+            ocr_dpi = 200
+            pdf_base_dpi = 72
+            ocr_scale = ocr_dpi / pdf_base_dpi  # OCR相对于PDF基础分辨率的缩放
+            
+            # 当前显示图像的缩放系数
+            display_scale = self.zoom_factor
+            
+            # 从OCR坐标到显示坐标的转换比例
+            scale_ratio = display_scale / ocr_scale
+            
+            scaled_coords = []
+            for x, y in ocr_coords:
+                scaled_x = x * scale_ratio
+                scaled_y = y * scale_ratio
+                scaled_coords.append([scaled_x, scaled_y])
+            
+            return scaled_coords
+        except Exception as e:
+            print(f"坐标转换错误: {e}")
+            return None
+
+    def highlight_text_box(self, box_coords):
+        """高亮显示指定的文字框
+        
+        Args:
+            box_coords: 文字框的四个角点坐标 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        """
+        # 清除之前的高亮
+        self.clear_highlights()
+        
+        # 添加新的高亮框
+        self.highlight_boxes = [box_coords]
+        
+        # 重新绘制页面
+        self.update_page_view()
+    
+    def clear_highlights(self):
+        """清除所有高亮"""
+        self.highlight_boxes = []
+        self.update_page_view()
     
     def next_page(self):
         """跳转到下一页"""

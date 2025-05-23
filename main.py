@@ -21,62 +21,77 @@ from pdf_viewer import PDFViewer
 class TTSWorker(QThread):
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    text_segment_started = pyqtSignal(int)  # 新增：开始朗读某个文字段的信号，参数为段落索引
+    text_segment_finished = pyqtSignal(int)  # 新增：完成朗读某个文字段的信号，参数为段落索引
+    request_speak = pyqtSignal(str, int)  # 新增：请求主线程朗读文字的信号
     
-    def __init__(self, text):
+    def __init__(self, text_segments, ocr_boxes):
         super().__init__()
-        self.text = text
-        self.engine = pyttsx3.init()
+        self.text_segments = text_segments  # 文字段列表
+        self.ocr_boxes = ocr_boxes  # 对应的文字框位置信息列表
         self.stop_requested = False
-        self.idle_count = 0  # 添加空闲检测计数器
+        self.current_segment_index = 0
+        self.segment_completed = False
 
     def run(self):
         try:
-            self.engine.say(self.text)
-            # 使用 non-blocking loop 允许中断
-            self.engine.startLoop(False)
-            while True: # 使用更明确的循环
+            print(f"TTSWorker开始：准备朗读 {len(self.text_segments)} 个文字段")
+            
+            # 逐个朗读每个段落
+            for i in range(len(self.text_segments)):
                 if self.stop_requested:
-                    print("TTSWorker: 收到停止请求，尝试结束循环。")
-                    # 尝试停止引擎并结束循环
-                    if self.engine:
-                        self.engine.stop() # 尝试立即停止发声
-                    break # 退出循环
-
-                self.engine.iterate() # 处理事件
-
-                # 改进的完成状态检测
-                if not self.engine.isBusy():
-                    self.idle_count += 1
-                    print(f"TTSWorker: 引擎空闲检测 ({self.idle_count}/3)")
-                    # 连续3次检测到空闲状态才认为真正完成
-                    if self.idle_count >= 3:
-                        print("TTSWorker: 检测到引擎不再繁忙，结束循环。")
-                        break
-                else:
-                    self.idle_count = 0  # 如果又变忙，重置计数器
-
-                QThread.msleep(100) # 稍微增加休眠时间
-
+                    print("收到停止请求，退出朗读循环")
+                    break
+                    
+                self.current_segment_index = i
+                current_text = self.text_segments[i]
+                
+                print(f"开始朗读段落 {i + 1}/{len(self.text_segments)}: {current_text[:30]}...")
+                
+                # 发送开始朗读信号
+                self.text_segment_started.emit(i)
+                
+                # 请求主线程朗读
+                self.segment_completed = False
+                self.request_speak.emit(current_text, i)
+                
+                # 等待朗读完成
+                timeout = 0
+                while not self.segment_completed and not self.stop_requested and timeout < 300:  # 最多等待30秒
+                    QThread.msleep(100)
+                    timeout += 1
+                
+                if self.stop_requested:
+                    break
+                    
+                if timeout >= 300:
+                    print(f"朗读段落 {i + 1} 超时")
+                    self.error.emit(f"朗读段落 {i + 1} 超时")
+                    break
+                
+                print(f"完成朗读段落 {i + 1}")
+                # 发送完成朗读信号
+                self.text_segment_finished.emit(i)
+                
+                # 在段落之间添加短暂停顿
+                if i < len(self.text_segments) - 1:
+                    QThread.msleep(100)
+            
+            print("所有段落朗读完成")
+            
         except Exception as e:
             self.error.emit(f"TTS 错误: {e}")
         finally:
-            # 确保引擎停止
-            try:
-                self.engine.stop()
-                if hasattr(self.engine, 'endLoop') and callable(self.engine.endLoop):
-                    self.engine.endLoop()
-            except Exception as e:
-                print(f"尝试结束TTS引擎时出错: {e}")
-            
             print("TTSWorker: run 方法结束，发送 finished 信号。")
             self.finished.emit()
+
+    def on_segment_complete(self):
+        """主线程通知段落朗读完成"""
+        self.segment_completed = True
 
     def stop(self):
         print("TTSWorker: stop() 方法被调用。")
         self.stop_requested = True
-        # 尝试停止引擎 (可能不是立即生效)
-        if self.engine:
-           self.engine.stop()
 
 
 class MainWindow(QMainWindow):
@@ -88,6 +103,14 @@ class MainWindow(QMainWindow):
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
         self.session_history = {} # 用于存储 {file_path: page_num}
         self.last_opened_file = None # 记录最后一个打开的文件路径
+
+        # 初始化 TTS 引擎（在主线程中）
+        try:
+            self.tts_engine = pyttsx3.init()
+            print("TTS引擎初始化成功")
+        except Exception as e:
+            self.tts_engine = None
+            print(f"TTS引擎初始化失败: {e}")
 
         # 初始化 OCR (首次运行时会自动下载模型)
         # 指定使用中文识别模型，启用角度分类
@@ -251,6 +274,12 @@ class MainWindow(QMainWindow):
         stop_action.triggered.connect(self.stop_reading)
         toolbar.addAction(stop_action)
         
+        # Clear Highlights
+        clear_highlights_action = QAction("清除高亮", self)
+        clear_highlights_action.setStatusTip("清除页面上的所有高亮标记")
+        clear_highlights_action.triggered.connect(self.clear_highlights)
+        toolbar.addAction(clear_highlights_action)
+        
     def open_file(self, file_path=None, page_num=0):
         # 在打开新文件之前，如果当前有文件打开，保存其状态
         if self.current_file and self.pdf_viewer.pdf_document:
@@ -367,30 +396,62 @@ class MainWindow(QMainWindow):
             self.ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False) 
             result = self.ocr.ocr(img_np, cls=True)
             if result and result[0]: # PaddleOCR 返回 [[lines...]] 格式
-                # 提取识别结果中的文本内容
-                texts = [line[1][0] for line in result[0] if line and len(line) >= 2]
+                # 提取识别结果中的文本内容和位置信息
+                text_data = []  # 存储 (box_coords, text_content, confidence, y_center) 的元组
                 
-                # 首先连接所有文本行，使用实际的换行符
-                full_text = "\n".join(texts) 
+                for line in result[0]:
+                    if line and len(line) >= 2:
+                        # line[0] 是文字框的四个角点坐标
+                        # line[1] 是 (文字内容, 置信度)
+                        box_coords = line[0]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                        text_content = line[1][0]
+                        confidence = line[1][1]
+                        
+                        # 只保留置信度较高的结果
+                        if confidence > 0.5:
+                            # 计算文字框的中心Y坐标用于排序
+                            y_coords = [point[1] for point in box_coords]
+                            y_center = sum(y_coords) / len(y_coords)
+                            # 计算文字框的中心X坐标用于同行内排序
+                            x_coords = [point[0] for point in box_coords]
+                            x_center = sum(x_coords) / len(x_coords)
+                            
+                            text_data.append((box_coords, text_content, confidence, y_center, x_center))
                 
-                # 然后替换显式的换行符字符串 "\n"（这可能是OCR错误识别的结果）
-                full_text = full_text.replace("\\n", "")
+                # 按照阅读顺序排序：先按Y坐标（从上到下），再按X坐标（从左到右）
+                # 对于Y坐标相近的文字（可能在同一行），按X坐标排序
+                def sort_key(item):
+                    y_center = item[3]
+                    x_center = item[4]
+                    # 将Y坐标量化到行，相近的Y坐标归为同一行
+                    row = int(y_center // 20)  # 假设行高约20像素
+                    return (row, x_center)
                 
-                # 使用适当的标点符号替换实际的换行符，以便朗读时有停顿
-                # 如果文本已经有标点符号，则不需要添加
-                full_text = full_text.replace("\n", "").replace(",,", ",").replace(", ,", ",")
+                text_data.sort(key=sort_key)
                 
-                # 打印部分识别结果以供调试，限制长度避免过多输出
-                print(f"识别结果 (前200字符):\n{full_text[:200]}...") 
+                # 分离排序后的数据
+                text_segments = []
+                ocr_boxes = []
+                for box_coords, text_content, confidence, _, _ in text_data:
+                    text_segments.append(text_content)
+                    ocr_boxes.append(box_coords)
                 
-                if full_text:
+                # 保存OCR结果供后续高亮使用
+                self.current_ocr_boxes = ocr_boxes
+                self.current_text_segments = text_segments
+                
+                # 打印部分识别结果以供调试
+                full_text = " ".join(text_segments)
+                print(f"识别到 {len(text_segments)} 个文字块")
+                print(f"所有文字段:")
+                for i, segment in enumerate(text_segments):
+                    print(f"  [{i+1}] {segment}")
+                print(f"合并文本 (前200字符):\n{full_text[:200]}...") 
+                
+                if text_segments:
                     # OCR 完成后，切换回主线程启动 TTS Worker
-                    # 使用 QMetaObject.invokeMethod 或 signal/slot 保证线程安全
-                    # 这里简化处理：直接在主线程消息循环中调用后续方法似乎也可以，
-                    # 但更健壮的方式是发信号。为简单起见，先直接调用。
-                    # 注意：statusBar 更新需要在主线程完成
                     self.statusBar.showMessage("识别完成，准备朗读...")
-                    self._start_tts(full_text) # 调用在主线程创建TTS Worker的方法
+                    self._start_tts_with_segments(text_segments, ocr_boxes)
                 else:
                     self.statusBar.showMessage("未识别到文字")
             else:
@@ -405,25 +466,60 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(error_msg)
             print(error_msg) # 在控制台打印详细错误
 
-    def _start_tts(self, text):
-         """在主线程中创建并启动 TTS QThread Worker"""
-         # 检查并停止之前的朗读任务
-         if self.tts_worker and self.tts_worker.isRunning():
-             print("检测到正在运行的 TTS worker，先停止...")
-             self.tts_worker.stop() # 请求停止
-             self.tts_worker.wait(2000) # 等待最多2秒结束
-             if self.tts_worker.isRunning():
-                 print("警告：旧的 TTS worker 未能在超时内停止。")
-             # self.tts_worker = None # 在 finished 或 error 信号中处理
+    def _start_tts_with_segments(self, text_segments, ocr_boxes):
+        """在主线程中创建并启动分段 TTS QThread Worker"""
+        # 检查TTS引擎是否可用
+        if not self.tts_engine:
+            self.statusBar.showMessage("TTS引擎未初始化，无法朗读")
+            return
+            
+        # 检查并停止之前的朗读任务
+        if self.tts_worker and self.tts_worker.isRunning():
+            print("检测到正在运行的 TTS worker，先停止...")
+            self.tts_worker.stop() # 请求停止
+            self.tts_worker.wait(2000) # 等待最多2秒结束
+            if self.tts_worker.isRunning():
+                print("警告：旧的 TTS worker 未能在超时内停止。")
 
-         print(f"准备朗读文本 (前100字符): {text[:100]}...")
-         self.tts_worker = TTSWorker(text)
-         # 连接信号和槽
-         self.tts_worker.finished.connect(self.on_tts_finished)
-         self.tts_worker.error.connect(self.on_tts_error)
-         # 启动线程
-         self.tts_worker.start()
-         self.statusBar.showMessage("正在朗读...")
+        print(f"准备朗读 {len(text_segments)} 个文字段...")
+        self.tts_worker = TTSWorker(text_segments, ocr_boxes)
+        # 连接信号和槽
+        self.tts_worker.finished.connect(self.on_tts_finished)
+        self.tts_worker.error.connect(self.on_tts_error)
+        self.tts_worker.text_segment_started.connect(self.on_text_segment_started)
+        self.tts_worker.text_segment_finished.connect(self.on_text_segment_finished)
+        self.tts_worker.request_speak.connect(self.on_request_speak)  # 新增：连接朗读请求信号
+        # 启动线程
+        self.tts_worker.start()
+        self.statusBar.showMessage("正在朗读...")
+
+    def on_text_segment_started(self, segment_index):
+        """开始朗读某个文字段时的槽函数"""
+        if hasattr(self, 'current_ocr_boxes') and segment_index < len(self.current_ocr_boxes):
+            box_coords = self.current_ocr_boxes[segment_index]
+            # 在PDF查看器上高亮显示当前朗读的文字框
+            self.pdf_viewer.highlight_text_box(box_coords)
+            
+            # 更新状态栏显示当前朗读进度
+            if hasattr(self, 'current_text_segments') and segment_index < len(self.current_text_segments):
+                current_text = self.current_text_segments[segment_index]
+                total_segments = len(self.current_text_segments)
+                self.statusBar.showMessage(f"正在朗读 ({segment_index + 1}/{total_segments}): {current_text[:30]}...")
+                print(f"开始朗读段落 {segment_index + 1}/{total_segments}: {current_text[:50]}...")
+    
+    def on_text_segment_finished(self, segment_index):
+        """完成朗读某个文字段时的槽函数"""
+        if hasattr(self, 'current_text_segments') and segment_index < len(self.current_text_segments):
+            total_segments = len(self.current_text_segments)
+            print(f"完成朗读段落 {segment_index + 1}/{total_segments}")
+            
+            # 如果是最后一段，提前更新状态
+            if segment_index == total_segments - 1:
+                self.statusBar.showMessage("朗读即将完成...")
+        
+        # 可选：在朗读完成后短暂保持高亮，然后清除
+        # 这里简单地保持高亮，等待下一段开始或者朗读完全结束时清除
+        pass
 
     def stop_reading(self):
         """停止 TTS 朗读"""
@@ -431,6 +527,15 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("正在停止朗读...")
             print("请求停止 TTS worker...")
             self.tts_worker.stop()
+            # 停止主线程的TTS引擎
+            if self.tts_engine:
+                try:
+                    self.tts_engine.stop()
+                    print("主线程TTS引擎已停止")
+                except Exception as e:
+                    print(f"停止主线程TTS引擎时出错: {e}")
+            # 清除高亮
+            self.pdf_viewer.clear_highlights()
             # 让 on_tts_finished 信号处理状态消息更新
         else:
             # 如果没有活动的 worker，也清空状态栏消息或设为默认
@@ -440,6 +545,9 @@ class MainWindow(QMainWindow):
     def on_tts_finished(self):
         """TTS Worker 完成时的槽函数"""
         print("TTS worker finished signal received.")
+        # 清除高亮
+        self.pdf_viewer.clear_highlights()
+        
         # 检查 worker 是否仍然存在且是我们期望的那个
         sender_worker = self.sender() 
         if sender_worker == self.tts_worker:
@@ -457,6 +565,9 @@ class MainWindow(QMainWindow):
     def on_tts_error(self, error_message):
         """TTS Worker 发生错误时的槽函数"""
         print(f"TTS worker error signal received: {error_message}")
+        # 清除高亮
+        self.pdf_viewer.clear_highlights()
+        
         sender_worker = self.sender()
         if sender_worker == self.tts_worker:
              self.statusBar.showMessage(f"朗读错误: {error_message}")
@@ -538,6 +649,28 @@ class MainWindow(QMainWindow):
         print("继续关闭窗口...")
         super().closeEvent(event)
 
+    def clear_highlights(self):
+        """清除页面高亮"""
+        self.pdf_viewer.clear_highlights()
+        self.statusBar.showMessage("已清除高亮标记")
+
+    def on_request_speak(self, text, segment_index):
+        """处理朗读请求（在主线程中执行）"""
+        try:
+            print(f"主线程开始朗读段落 {segment_index + 1}: {text[:30]}...")
+            # 在主线程中朗读
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+            print(f"主线程完成朗读段落 {segment_index + 1}")
+            
+            # 通知worker段落朗读完成
+            if self.tts_worker:
+                self.tts_worker.on_segment_complete()
+                
+        except Exception as e:
+            print(f"主线程朗读时出错: {e}")
+            if self.tts_worker:
+                self.tts_worker.error.emit(f"朗读错误: {e}")
 
 def main():
     app = QApplication(sys.argv)
