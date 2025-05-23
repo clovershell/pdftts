@@ -2,6 +2,8 @@
 
 这是一个基于PyQt6和PyMuPDF的PDF阅读器应用程序，集成了OCR识别和TTS语音朗读功能。
 
+![cover](cover.png)
+
 ## 功能特性
 
 - 📖 打开PDF文件
