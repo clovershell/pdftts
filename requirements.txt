@@ -1,6 +1,6 @@
 PyQt6
 PyMuPDF
 paddlepaddle
-paddleocr
+paddleocr<3.0.0
 pyttsx3
 opencv-python

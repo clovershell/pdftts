@@ -2,3 +2,8 @@
 __pycache__
 config.json
 .cursor
+build
+dist
+.venv
+main.build
+main.dist
