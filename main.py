@@ -16,8 +16,54 @@ from PIL import Image
 
 from pdf_viewer import PDFViewer
 
-global was_stopped
-was_stopped = False
+# ==================== TTS State Manager ====================
+class TTSState:
+    def __init__(self):
+        self._was_stopped = False
+        self._current_segment = 0
+        self._total_segments = 0
+        self._is_reading = False
+        
+    @property
+    def was_stopped(self):
+        return self._was_stopped
+        
+    @was_stopped.setter
+    def was_stopped(self, value):
+        self._was_stopped = value
+        
+    @property
+    def current_segment(self):
+        return self._current_segment
+        
+    @current_segment.setter
+    def current_segment(self, value):
+        self._current_segment = value
+        
+    @property
+    def total_segments(self):
+        return self._total_segments
+        
+    @total_segments.setter
+    def total_segments(self, value):
+        self._total_segments = value
+        
+    @property
+    def is_reading(self):
+        return self._is_reading
+        
+    @is_reading.setter
+    def is_reading(self, value):
+        self._is_reading = value
+        
+    def reset(self):
+        self._was_stopped = False
+        self._current_segment = 0
+        self._is_reading = False
+        
+    def stop(self):
+        self._was_stopped = True
+        self._is_reading = False
 
 # ==================== TTS Worker ====================
 # 使用 QThread 处理耗时任务，避免 UI 冻结
@@ -28,13 +74,15 @@ class TTSWorker(QThread):
     text_segment_finished = pyqtSignal(int)  # 新增：完成朗读某个文字段的信号，参数为段落索引
     request_speak = pyqtSignal(str, int)  # 新增：请求主线程朗读文字的信号
     
-    def __init__(self, text_segments, ocr_boxes):
+    def __init__(self, text_segments, ocr_boxes, tts_state):
         super().__init__()
         self.text_segments = text_segments  # 文字段列表
         self.ocr_boxes = ocr_boxes  # 对应的文字框位置信息列表
         self.stop_requested = False
-        self.current_segment_index = 0
         self.segment_completed = False
+        self.tts_state = tts_state  # 使用TTSState实例
+        self.tts_state.total_segments = len(text_segments)
+        self.tts_state.is_reading = True
 
     def run(self):
         try:
@@ -44,12 +92,14 @@ class TTSWorker(QThread):
                 if self.stop_requested:
                     print(f"TTSWorker: 收到停止请求 (在循环顶部)，退出朗读循环. 段落索引: {i}")
                     break
-                self.current_segment_index = i
+                
+                self.tts_state.current_segment = i
                 current_text = self.text_segments[i]
-                if was_stopped:
-                    self.text_segment_started.emit(i - 1 if i > 0 else 0)
-                else:   
-                    self.text_segment_started.emit(i)
+                
+                # 使用TTSState来控制段落索引
+                segment_index = i - 1 if self.tts_state.was_stopped and i > 0 else i
+                self.text_segment_started.emit(segment_index)
+                
                 self.segment_completed = False
                 self.request_speak.emit(current_text, i)
                 
@@ -83,6 +133,7 @@ class TTSWorker(QThread):
             print(f"TTSWorker: run 方法发生异常: {e}")
             self.error.emit(f"TTS 错误: {e}")
         finally:
+            self.tts_state.is_reading = False
             print(f"TTSWorker: run 方法结束 (finally块), stop_requested={self.stop_requested}. 发送 finished 信号。")
             self.finished.emit()
 
@@ -93,8 +144,7 @@ class TTSWorker(QThread):
     def stop(self):
         print("TTSWorker: stop() 方法被调用。")
         self.stop_requested = True
-        global was_stopped
-        was_stopped = True
+        self.tts_state.stop()  # 使用TTSState的stop方法
 
 
 class MainWindow(QMainWindow):
@@ -107,6 +157,7 @@ class MainWindow(QMainWindow):
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
         self.session_history = {} # 用于存储 {file_path: page_num}
         self.last_opened_file = None # 记录最后一个打开的文件路径
+        self.tts_state = TTSState()  # 初始化TTSState实例
 
         # 初始化 TTS 引擎（在主线程中）
         self._init_tts_engine()
@@ -526,7 +577,7 @@ class MainWindow(QMainWindow):
                 return
             
         print(f"MainWindow: _start_tts_with_segments - 创建新的 TTSWorker 实例，准备朗读 {len(text_segments)} 个段落.")
-        self.tts_worker = TTSWorker(text_segments, ocr_boxes)
+        self.tts_worker = TTSWorker(text_segments, ocr_boxes, self.tts_state)
         # 连接信号和槽
         self.tts_worker.finished.connect(self.on_tts_finished)
         self.tts_worker.error.connect(self.on_tts_error)
