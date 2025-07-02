@@ -7,3 +7,5 @@ dist
 .venv
 main.build
 main.dist
+*.bat
+.claude/

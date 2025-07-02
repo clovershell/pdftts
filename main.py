@@ -2,7 +2,8 @@ import sys
 import os
 import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QFileDialog, QToolBar, 
-                           QStatusBar, QVBoxLayout, QWidget, QScrollArea, QLabel)
+                           QStatusBar, QVBoxLayout, QWidget, QScrollArea, QLabel,
+                           QHBoxLayout, QLineEdit, QPushButton)
 from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QKeySequence, QWheelEvent
 import fitz  # PyMuPDF
@@ -188,6 +189,10 @@ class MainWindow(QMainWindow):
         self.pdf_viewer = PDFViewer()
         layout.addWidget(self.pdf_viewer)
         
+        # 创建跳页控制栏
+        self.create_page_navigation()
+        layout.addWidget(self.page_nav_widget)
+        
         # 创建工具栏
         self.create_toolbar()
         
@@ -198,9 +203,51 @@ class MainWindow(QMainWindow):
         
         # 连接页面变更信号
         self.pdf_viewer.page_changed.connect(self.update_status_bar)
+        self.pdf_viewer.page_changed.connect(self.update_page_navigation_state)
         
         # 添加键盘快捷键
         self.setup_shortcuts()
+        
+    def create_page_navigation(self):
+        """创建页面导航控制栏"""
+        self.page_nav_widget = QWidget()
+        nav_layout = QHBoxLayout(self.page_nav_widget)
+        nav_layout.setContentsMargins(10, 5, 10, 5)
+        
+        # 上一页按钮
+        self.prev_page_btn = QPushButton("上一页")
+        self.prev_page_btn.clicked.connect(self.pdf_viewer.prev_page)
+        nav_layout.addWidget(self.prev_page_btn)
+        
+        # 页面信息标签
+        self.page_info_label = QLabel("请打开PDF文件")
+        nav_layout.addWidget(self.page_info_label)
+        
+        # 跳页输入框
+        nav_layout.addWidget(QLabel("转到第"))
+        self.page_input = QLineEdit()
+        self.page_input.setFixedWidth(60)
+        self.page_input.setPlaceholderText("页码")
+        self.page_input.returnPressed.connect(self.go_to_page)
+        nav_layout.addWidget(self.page_input)
+        
+        nav_layout.addWidget(QLabel("页"))
+        
+        # 跳页按钮
+        self.go_to_page_btn = QPushButton("跳转")
+        self.go_to_page_btn.clicked.connect(self.go_to_page)
+        nav_layout.addWidget(self.go_to_page_btn)
+        
+        # 下一页按钮
+        self.next_page_btn = QPushButton("下一页")
+        self.next_page_btn.clicked.connect(self.pdf_viewer.next_page)
+        nav_layout.addWidget(self.next_page_btn)
+        
+        # 添加弹性空间
+        nav_layout.addStretch()
+        
+        # 初始状态下禁用控件
+        self.update_page_navigation_state()
         
     def setup_shortcuts(self):
         """设置键盘快捷键"""
@@ -388,6 +435,67 @@ class MainWindow(QMainWindow):
                 self.last_opened_file = None # 如果是最后一个打开的文件，也清除
             # self.save_session() # 可以选择保存这个移除操作
 
+    def go_to_page(self):
+        """跳转到指定页面"""
+        if not self.pdf_viewer.pdf_document:
+            self.statusBar.showMessage("请先打开PDF文件")
+            return
+            
+        try:
+            page_text = self.page_input.text().strip()
+            if not page_text:
+                self.statusBar.showMessage("请输入页码")
+                return
+                
+            page_num = int(page_text)
+            total_pages = self.pdf_viewer.page_count
+            
+            if page_num < 1:
+                self.statusBar.showMessage("页码不能小于1")
+                self.page_input.selectAll()
+                return
+            elif page_num > total_pages:
+                self.statusBar.showMessage(f"页码不能大于{total_pages}")
+                self.page_input.selectAll()
+                return
+            
+            # 转换为0基索引
+            if self.pdf_viewer.go_to_page(page_num - 1):
+                self.statusBar.showMessage(f"已跳转到第{page_num}页")
+                self.page_input.clear()
+            else:
+                self.statusBar.showMessage("跳转失败")
+                
+        except ValueError:
+            self.statusBar.showMessage("请输入有效的页码数字")
+            self.page_input.selectAll()
+        except Exception as e:
+            self.statusBar.showMessage(f"跳转出错: {e}")
+    
+    def update_page_navigation_state(self):
+        """更新页面导航控件状态"""
+        if not self.pdf_viewer.pdf_document:
+            # 没有文档时禁用所有控件
+            self.prev_page_btn.setEnabled(False)
+            self.next_page_btn.setEnabled(False)
+            self.page_input.setEnabled(False)
+            self.go_to_page_btn.setEnabled(False)
+            self.page_info_label.setText("请打开PDF文件")
+        else:
+            current_page = self.pdf_viewer.current_page_num + 1  # 转换为1基索引
+            total_pages = self.pdf_viewer.page_count
+            
+            # 更新页面信息显示
+            self.page_info_label.setText(f"第 {current_page} 页，共 {total_pages} 页")
+            
+            # 启用输入框和跳转按钮
+            self.page_input.setEnabled(True)
+            self.go_to_page_btn.setEnabled(True)
+            
+            # 根据当前页面位置启用/禁用上一页和下一页按钮
+            self.prev_page_btn.setEnabled(current_page > 1)
+            self.next_page_btn.setEnabled(current_page < total_pages)
+    
     def update_status_bar(self):
         """更新状态栏信息"""
         if self.pdf_viewer.pdf_document:
